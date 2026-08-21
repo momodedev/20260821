@@ -418,7 +418,7 @@ $LongPathFiles = @()
 $InvalidFiles = @()
 $LargestFilesCandidates = @()
 $TotalFilesScanned = 0
-$TotalSizeBytes = 0
+# $TotalSizeBytes = 0
 
 foreach ($Folder in $Folders)
 {
@@ -462,7 +462,7 @@ foreach ($Folder in $Folders)
     {
         $FolderFileCount++
         $TotalFilesScanned++
-        $TotalSizeBytes += $File.Length
+        # $TotalSizeBytes += $File.Length
 
         $Ext = if ([string]::IsNullOrEmpty($File.Extension)) { "(none)" } else { $File.Extension }
         if (-not $ExtensionCounts.ContainsKey($Ext)) { $ExtensionCounts[$Ext] = 0 }
@@ -565,7 +565,7 @@ $Summary = [PSCustomObject]@{
     SmbFolders        = $SmbFolders.Count
     SftpFolders       = $SftpFolders.Count
     TotalFiles        = $TotalFilesScanned
-    TotalSizeGB       = [Math]::Round(($TotalSizeBytes / 1GB), 2)
+    # TotalSizeGB     = [Math]::Round(($TotalSizeBytes / 1GB), 2)
     ColdFiles         = $ColdFilesCount
     LongPathFiles     = $LongPathCount
     InvalidNames      = $InvalidFileCount
