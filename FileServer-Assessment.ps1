@@ -28,6 +28,9 @@ param(
     # Local usernames to check for SFTP root directory; defaults to users found in sshd_config "Match User" blocks
     [string[]]$SftpUsers = @(),
 
+    # SFTP root directories to scan; leave empty (default) to auto-discover from sshd_config "Match User" blocks
+    [string[]]$SftpRootDirectories = @(),
+
     # Files older than this many days (by LastWriteTime) are reported as cold data
     [int]$ColdDataThresholdDays = 365,
 
@@ -106,39 +109,223 @@ Export-Csv `
 
 if ($TargetFolders -and $TargetFolders.Count -gt 0)
 {
-    $Folders = $TargetFolders
+    $SmbFolders = $TargetFolders
 }
 else
 {
     Write-Host "No -TargetFolders specified; auto-discovering from local SMB shares..."
-    $Folders = $FilteredShares.Path
+    $SmbFolders = $FilteredShares.Path
 }
 
-$Folders = $Folders |
+$SmbFolders = $SmbFolders |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
     Sort-Object -Unique
 
-$ValidFolders = @()
-foreach ($Folder in $Folders)
+$ValidSmbFolders = @()
+foreach ($Folder in $SmbFolders)
 {
     if (Test-Path $Folder)
     {
-        $ValidFolders += $Folder
+        $ValidSmbFolders += $Folder
     }
     else
     {
         Write-AssessmentError "Discovery" $Folder "Path not found or inaccessible; skipped"
     }
 }
-$Folders = $ValidFolders
+$SmbFolders = $ValidSmbFolders
 
-Write-Host "Target folders to assess: $($Folders.Count)"
+Write-Host "SMB target folders to assess: $($SmbFolders.Count)"
+
+
+###########################################################################
+# 2. SFTP Root Directory Detection (Windows OpenSSH)
+###########################################################################
+# Same auto-discovery pattern as SMB shares: if -SftpRootDirectories is not
+# specified, root directories are auto-detected from sshd_config "Match User"
+# blocks (falling back to each user's profile path when chroot isn't set) and
+# then merged into the scan target list below.
+
+Write-Host ""
+Write-Host "Detecting SFTP Root Directories..."
+
+$SftpRootResults = @()
+$SftpFolders = @()
+
+if ($SftpRootDirectories -and $SftpRootDirectories.Count -gt 0)
+{
+    $SftpFolders = $SftpRootDirectories
+}
+else
+{
+    $SshdConfigPath = "$env:ProgramData\ssh\sshd_config"
+
+    if (-not (Test-Path $SshdConfigPath))
+    {
+        Write-Warning "OpenSSH sshd_config not found at '$SshdConfigPath'. Skipping SFTP root directory auto-detection."
+    }
+    else
+    {
+        $ConfigLines = Get-Content $SshdConfigPath
+
+        # Only "Match User" blocks and top-level directives are honored; other Match types (Group/Address) are ignored
+        $GlobalChroot = $null
+        $CurrentMatchUsers = @()
+        $MatchChrootMap = @{}
+
+        foreach ($Line in $ConfigLines)
+        {
+            $Trimmed = $Line.Trim()
+
+            if ($Trimmed -eq "" -or $Trimmed.StartsWith("#"))
+            {
+                continue
+            }
+
+            $IsIndented = $Line -match '^\s+\S'
+
+            if (-not $IsIndented -and $Trimmed -match '^Match\s+User\s+(.+)$')
+            {
+                $CurrentMatchUsers = $Matches[1] -split '[,\s]+' | Where-Object { $_ -ne "" }
+                foreach ($MatchUser in $CurrentMatchUsers)
+                {
+                    if (-not $MatchChrootMap.ContainsKey($MatchUser))
+                    {
+                        $MatchChrootMap[$MatchUser] = $null
+                    }
+                }
+                continue
+            }
+
+            if (-not $IsIndented -and $Trimmed -match '^Match\b')
+            {
+                # Non "Match User" block (e.g. Match Group/Address) - stop tracking user-specific directives
+                $CurrentMatchUsers = @()
+                continue
+            }
+
+            if ($Trimmed -match '^ChrootDirectory\s+(.+)$')
+            {
+                $ChrootValue = $Matches[1].Trim()
+
+                if ($IsIndented -and $CurrentMatchUsers.Count -gt 0)
+                {
+                    foreach ($MatchUser in $CurrentMatchUsers)
+                    {
+                        $MatchChrootMap[$MatchUser] = $ChrootValue
+                    }
+                }
+                elseif (-not $IsIndented)
+                {
+                    $GlobalChroot = $ChrootValue
+                    $CurrentMatchUsers = @()
+                }
+            }
+            elseif (-not $IsIndented)
+            {
+                # A new top-level (unindented) directive ends any active Match block
+                $CurrentMatchUsers = @()
+            }
+        }
+
+        $UsersToCheck = if ($SftpUsers -and $SftpUsers.Count -gt 0)
+        {
+            $SftpUsers
+        }
+        else
+        {
+            $MatchChrootMap.Keys
+        }
+
+        foreach ($UserName in $UsersToCheck)
+        {
+            $ConfiguredChroot = if ($MatchChrootMap.ContainsKey($UserName) -and $MatchChrootMap[$UserName])
+            {
+                $MatchChrootMap[$UserName]
+            }
+            else
+            {
+                $GlobalChroot
+            }
+
+            $ChrootEnabled = (-not [string]::IsNullOrWhiteSpace($ConfiguredChroot)) -and ($ConfiguredChroot -ne "none")
+
+            $ProfilePath = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+                Where-Object { (Split-Path $_.LocalPath -Leaf) -eq $UserName } |
+                Select-Object -First 1 -ExpandProperty LocalPath
+
+            if (-not $ProfilePath)
+            {
+                $ProfilePath = "C:\Users\$UserName"
+            }
+
+            $EffectiveRoot = if ($ChrootEnabled)
+            {
+                $ConfiguredChroot -replace '%u', $UserName
+            }
+            else
+            {
+                $ProfilePath
+            }
+
+            $SftpRootResults += [PSCustomObject]@{
+                UserName                  = $UserName
+                ConfiguredChrootDirectory = $ConfiguredChroot
+                ChrootEnabled             = $ChrootEnabled
+                ProfilePath               = $ProfilePath
+                EffectiveSftpRoot         = $EffectiveRoot
+            }
+        }
+
+        if ($SftpRootResults.Count -eq 0)
+        {
+            Write-Warning "No 'Match User' blocks found in sshd_config and no -SftpUsers specified. Nothing to auto-detect."
+        }
+
+        $SftpFolders = $SftpRootResults | Select-Object -ExpandProperty EffectiveSftpRoot
+    }
+}
+
+$SftpFolders = $SftpFolders |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    Sort-Object -Unique
+
+$ValidSftpFolders = @()
+foreach ($Folder in $SftpFolders)
+{
+    if (Test-Path $Folder)
+    {
+        $ValidSftpFolders += $Folder
+    }
+    else
+    {
+        Write-AssessmentError "SftpDiscovery" $Folder "SFTP root directory not found or inaccessible; skipped"
+    }
+}
+$SftpFolders = $ValidSftpFolders
+
+Write-Host "SFTP root folders to assess: $($SftpFolders.Count)"
+
+$SftpRootResults |
+Export-Csv `
+    "$OutputFolder\SftpRootDirectory.csv" `
+    -NoTypeInformation `
+    -Encoding UTF8
+
+
+###########################################################################
+# 3. Combined Target Folder List
+###########################################################################
+
+$Folders = @($SmbFolders + $SftpFolders) | Sort-Object -Unique
 
 if ($Folders.Count -eq 0)
 {
     Write-Warning "No valid target folders to assess. Exiting."
     return
 }
+
+Write-Host "Total folders to assess (SMB + SFTP): $($Folders.Count)"
 
 # Build a unique, filesystem-safe report-name per folder (handles duplicate leaf
 # names, drive letters, and special characters such as & or spaces in share paths)
@@ -173,7 +360,7 @@ foreach ($Folder in $Folders)
 
 
 ###########################################################################
-# 2. ACL Export + Single-Pass File Scan
+# 4. ACL Export + Single-Pass File Scan
 ###########################################################################
 # Each folder is enumerated recursively exactly once; the resulting file list
 # feeds file counts, extension stats, last-access, cold data, long-path,
@@ -321,148 +508,7 @@ Export-Csv "$OutputFolder\LargestFiles.csv" -NoTypeInformation -Encoding UTF8
 
 
 ###########################################################################
-# 9b. SFTP Root Directory Detection (Windows OpenSSH)
-###########################################################################
-
-Write-Host ""
-Write-Host "Detecting SFTP Root Directories..."
-
-$SshdConfigPath = "$env:ProgramData\ssh\sshd_config"
-
-$SftpRootResults = @()
-
-if (-not (Test-Path $SshdConfigPath))
-{
-    Write-Warning "OpenSSH sshd_config not found at '$SshdConfigPath'. Skipping SFTP root directory detection."
-}
-else
-{
-    $ConfigLines = Get-Content $SshdConfigPath
-
-    # Only "Match User" blocks and top-level directives are honored; other Match types (Group/Address) are ignored
-    $GlobalChroot = $null
-    $CurrentMatchUsers = @()
-    $MatchChrootMap = @{}
-
-    foreach ($Line in $ConfigLines)
-    {
-        $Trimmed = $Line.Trim()
-
-        if ($Trimmed -eq "" -or $Trimmed.StartsWith("#"))
-        {
-            continue
-        }
-
-        $IsIndented = $Line -match '^\s+\S'
-
-        if (-not $IsIndented -and $Trimmed -match '^Match\s+User\s+(.+)$')
-        {
-            $CurrentMatchUsers = $Matches[1] -split '[,\s]+' | Where-Object { $_ -ne "" }
-            foreach ($MatchUser in $CurrentMatchUsers)
-            {
-                if (-not $MatchChrootMap.ContainsKey($MatchUser))
-                {
-                    $MatchChrootMap[$MatchUser] = $null
-                }
-            }
-            continue
-        }
-
-        if (-not $IsIndented -and $Trimmed -match '^Match\b')
-        {
-            # Non "Match User" block (e.g. Match Group/Address) - stop tracking user-specific directives
-            $CurrentMatchUsers = @()
-            continue
-        }
-
-        if ($Trimmed -match '^ChrootDirectory\s+(.+)$')
-        {
-            $ChrootValue = $Matches[1].Trim()
-
-            if ($IsIndented -and $CurrentMatchUsers.Count -gt 0)
-            {
-                foreach ($MatchUser in $CurrentMatchUsers)
-                {
-                    $MatchChrootMap[$MatchUser] = $ChrootValue
-                }
-            }
-            elseif (-not $IsIndented)
-            {
-                $GlobalChroot = $ChrootValue
-                $CurrentMatchUsers = @()
-            }
-        }
-        elseif (-not $IsIndented)
-        {
-            # A new top-level (unindented) directive ends any active Match block
-            $CurrentMatchUsers = @()
-        }
-    }
-
-    $UsersToCheck = if ($SftpUsers -and $SftpUsers.Count -gt 0)
-    {
-        $SftpUsers
-    }
-    else
-    {
-        $MatchChrootMap.Keys
-    }
-
-    foreach ($UserName in $UsersToCheck)
-    {
-        $ConfiguredChroot = if ($MatchChrootMap.ContainsKey($UserName) -and $MatchChrootMap[$UserName])
-        {
-            $MatchChrootMap[$UserName]
-        }
-        else
-        {
-            $GlobalChroot
-        }
-
-        $ChrootEnabled = (-not [string]::IsNullOrWhiteSpace($ConfiguredChroot)) -and ($ConfiguredChroot -ne "none")
-
-        $ProfilePath = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
-            Where-Object { (Split-Path $_.LocalPath -Leaf) -eq $UserName } |
-            Select-Object -First 1 -ExpandProperty LocalPath
-
-        if (-not $ProfilePath)
-        {
-            $ProfilePath = "C:\Users\$UserName"
-        }
-
-        $EffectiveRoot = if ($ChrootEnabled)
-        {
-            $ConfiguredChroot -replace '%u', $UserName
-        }
-        else
-        {
-            $ProfilePath
-        }
-
-        $SftpRootResults += [PSCustomObject]@{
-            UserName                  = $UserName
-            ConfiguredChrootDirectory = $ConfiguredChroot
-            ChrootEnabled             = $ChrootEnabled
-            ProfilePath               = $ProfilePath
-            EffectiveSftpRoot         = $EffectiveRoot
-        }
-    }
-
-    if ($SftpRootResults.Count -eq 0)
-    {
-        Write-Warning "No 'Match User' blocks found in sshd_config and no -SftpUsers specified. Nothing to report."
-    }
-}
-
-$SftpRootResults |
-Export-Csv `
-    "$OutputFolder\SftpRootDirectory.csv" `
-    -NoTypeInformation `
-    -Encoding UTF8
-
-
-###########################################################################
-# 10. Assessment Summary
+# 5. Assessment Summary
 ###########################################################################
 
 Write-Host ""
@@ -474,15 +520,17 @@ $InvalidFileCount = if ($null -eq $InvalidFiles) { 0 } else { @($InvalidFiles).C
 $SftpUserCount = if ($null -eq $SftpRootResults) { 0 } else { @($SftpRootResults).Count }
 
 $Summary = [PSCustomObject]@{
-    AssessmentDate = Get-Date
-    TotalFolders   = $Folders.Count
-    TotalFiles     = $TotalFilesScanned
-    TotalSizeGB    = [Math]::Round(($TotalSizeBytes / 1GB), 2)
-    ColdFiles      = $ColdFilesCount
-    LongPathFiles  = $LongPathCount
-    InvalidNames   = $InvalidFileCount
-    SftpUsersFound = $SftpUserCount
-    ScanErrors     = $ErrorLog.Count
+    AssessmentDate    = Get-Date
+    TotalFolders      = $Folders.Count
+    SmbFolders        = $SmbFolders.Count
+    SftpFolders       = $SftpFolders.Count
+    TotalFiles        = $TotalFilesScanned
+    TotalSizeGB       = [Math]::Round(($TotalSizeBytes / 1GB), 2)
+    ColdFiles         = $ColdFilesCount
+    LongPathFiles     = $LongPathCount
+    InvalidNames      = $InvalidFileCount
+    SftpUsersFound    = $SftpUserCount
+    ScanErrors        = $ErrorLog.Count
 }
 
 $Summary | Export-Csv `
