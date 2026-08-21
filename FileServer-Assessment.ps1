@@ -7,11 +7,22 @@
 # Usage:
 #   .\FileServer-Assessment.ps1 -OutputFolder "C:\Assessment"
 #   .\FileServer-Assessment.ps1 -TargetFolders "F:\Finance","F:\HR"
+#   .\FileServer-Assessment.ps1 -SftpRootDirectories "F:\SFTPDrop"
 #
 # Notes:
 #   - When -TargetFolders is omitted, scan targets are auto-discovered from
 #     local SMB shares (built-in shares such as ADMIN$, IPC$, print$ and
 #     single drive-letter shares like C$/D$/K$ are excluded automatically).
+#   - When -SftpRootDirectories is omitted, SFTP root directories are
+#     auto-detected per Windows OpenSSH's actual behavior: an active,
+#     uncommented "ChrootDirectory" inside a "Match User" block wins;
+#     otherwise the root is the user's local profile path (Get-CimInstance
+#     Win32_UserProfile, falling back to C:\Users\<user>). If the real data
+#     lives behind a junction/symlink inside that profile (a common pattern
+#     when ChrootDirectory isn't used, e.g. C:\Users\<user>\Data pointing at
+#     F:\SFTPDrop\<user>), the resolved junction target is auto-scanned too.
+#     If you already know the real data path, pass it directly with
+#     -SftpRootDirectories to skip auto-detection entirely.
 #   - Each folder is scanned with a single recursive file enumeration that
 #     feeds every downstream report, which keeps runtime reasonable on
 #     multi-drive, multi-terabyte file servers with many shares.
@@ -268,12 +279,35 @@ else
                 $ProfilePath
             }
 
+            # When Chroot isn't enabled, the real data often lives behind a junction/symlink
+            # inside the profile root (e.g. C:\Users\<user>\Data -> F:\SFTPDrop\<user>) rather
+            # than in the profile shell itself, so surface and scan those resolved targets too.
+            $JunctionTargets = @()
+            if (-not $ChrootEnabled -and (Test-Path $EffectiveRoot))
+            {
+                $ReparseChildren = Get-ChildItem -Path $EffectiveRoot -Directory -Force -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LinkType -in @('Junction', 'SymbolicLink', 'HardLink') -and $_.Target }
+
+                foreach ($Child in $ReparseChildren)
+                {
+                    foreach ($Target in $Child.Target)
+                    {
+                        if (-not [string]::IsNullOrWhiteSpace($Target))
+                        {
+                            $JunctionTargets += $Target
+                        }
+                    }
+                }
+            }
+            $JunctionTargets = $JunctionTargets | Sort-Object -Unique
+
             $SftpRootResults += [PSCustomObject]@{
                 UserName                  = $UserName
                 ConfiguredChrootDirectory = $ConfiguredChroot
                 ChrootEnabled             = $ChrootEnabled
                 ProfilePath               = $ProfilePath
                 EffectiveSftpRoot         = $EffectiveRoot
+                JunctionTargets           = $JunctionTargets -join '; '
             }
         }
 
@@ -282,7 +316,13 @@ else
             Write-Warning "No 'Match User' blocks found in sshd_config and no -SftpUsers specified. Nothing to auto-detect."
         }
 
-        $SftpFolders = $SftpRootResults | Select-Object -ExpandProperty EffectiveSftpRoot
+        # Scan both the effective root and any junction/symlink targets found inside it
+        $SftpFolders = @(
+            $SftpRootResults | Select-Object -ExpandProperty EffectiveSftpRoot
+            $SftpRootResults | Select-Object -ExpandProperty JunctionTargets |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { $_ -split ';\s*' }
+        )
     }
 }
 
