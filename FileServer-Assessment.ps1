@@ -585,6 +585,29 @@ if ($ErrorLog.Count -gt 0)
 
 
 ###########################################################################
+# 6. Folder Access Matrix (SMB vs SFTP)
+###########################################################################
+
+Write-Host ""
+Write-Host "Creating Folder Access Matrix..."
+
+$AccessMatrix = foreach ($Folder in $Folders)
+{
+    [PSCustomObject]@{
+        Folder = $Folder
+        SMB    = if ($SmbFolders -contains $Folder) { "Yes" } else { "No" }
+        SFTP   = if ($SftpFolders -contains $Folder) { "Yes" } else { "No" }
+    }
+}
+
+$AccessMatrix |
+Export-Csv "$OutputFolder\FolderAccessMatrix.csv" -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+$AccessMatrix | Format-Table Folder, SMB, SFTP -AutoSize | Out-Host
+
+
+###########################################################################
 # Completion
 ###########################################################################
 
