@@ -1,6 +1,5 @@
 ###########################################################################
 # File Server Assessment Script
-# Author: CZ Lab
 # Purpose:
 #   Azure File Server Migration Assessment
 #   Suitable for Azure Files / Azure Migrate Discovery
